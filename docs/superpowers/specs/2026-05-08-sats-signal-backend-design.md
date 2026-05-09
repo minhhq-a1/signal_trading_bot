@@ -656,7 +656,7 @@ market_filters:
 ## 8. Project Structure
 
 ```
-signal_backend/
+signal_backend/                  # stb_development/signal_backend/
 ├── main.py                      # FastAPI app, startup, lifespan
 ├── config.py                    # YAML config loader + pydantic model
 ├── config.yaml                  # All configuration
@@ -693,12 +693,16 @@ signal_backend/
 ├── templates/
 │   ├── base.html
 │   ├── index.html               # Payload input form
-│   ├── result.html             # Verdict result display
-│   └── dashboard.html          # Stats dashboard
+│   ├── result.html              # Verdict result display
+│   └── dashboard.html           # Stats dashboard
 │
-└── static/
-    ├── style.css
-    └── chart.js                # Simple JS charts (Chart.js CDN)
+├── static/
+│   ├── style.css
+│   └── chart.js                 # Simple JS charts (Chart.js CDN)
+│
+├── Dockerfile                   # Production container
+├── docker-compose.yml           # Local dev + production compose
+└── .env.example                # Environment variables template
 ```
 
 ---
@@ -793,3 +797,123 @@ Normative rule:
 - MVP only enforces `tqi`.
 - `er` and `structure` thresholds become active in target v1, and only when those fields are present in the normalized payload.
 - Missing deferred fields must not downgrade an MVP signal by themselves.
+
+---
+
+## 13. Deployment Architecture
+
+### MVP — Local + Tunnel
+
+```
+TradingView (Webhook alert)
+       │
+       ▼  POST /webhook/sats
+┌─────────────────────┐
+│  Local FastAPI       │
+│  uvicorn :8000       │
+└─────────┬───────────┘
+          │ ngrok http 8000
+          │    hoặc cloudflared tunnel --url http://localhost:8000
+          ▼
+    Public webhook URL
+    → TradingView alert config
+```
+
+- Run: `uvicorn main:app --reload --port 8000`
+- Expose: `ngrok http 8000` hoặc `cloudflared tunnel --url http://localhost:8000`
+- Copy public HTTPS URL vào TradingView alert webhook config
+- Telegram bot gửi trực tiếp từ local
+
+### Production — VPS + Docker
+
+```
+┌──────────────────────────────────────┐
+│  VPS (Docker Host)                    │
+│                                      │
+│  ┌──────────────────────────────┐   │
+│  │  docker-compose.yml           │   │
+│  │  ├── signal_backend (FastAPI) │   │
+│  │  └── redis (optional/future)  │   │
+│  └──────────────────────────────┘   │
+│                 │                    │
+│  Reverse proxy (nginx/Caddy)         │
+│                 │                    │
+│  TradingView webhook ── Telegram    │
+└──────────────────────────────────────┘
+```
+
+### Database Roadmap
+
+| Giai đoạn | Storage | Lý do |
+|---|---|---|
+| MVP | SQLite | Zero setup, portable, đủ cho single-instance |
+| Production v1 | SQLite + Redis | Redis cho state cache, cooldown, message queue |
+| Production v2+ | PostgreSQL + Redis | Full RDBMS cho analytics, complex queries |
+
+**Redis integration (production):**
+- Session/state cache: `latest_states` cache với TTL
+- Direction cooldown: Redis SETEX với TTL per symbol+tf+action
+- Message queue: Redis Streams cho async Telegram delivery (retry logic)
+- SQLite vẫn giữ là source-of-truth cho audit logs
+
+### Environment Variables
+
+```bash
+# .env (KHÔNG commit)
+APP_HOST=0.0.0.0
+APP_PORT=8000
+APP_DEBUG=true
+
+WEBHOOK_SECRET=your_webhook_secret
+
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
+
+# Trading
+ACCOUNT_BALANCE=10000.0
+RISK_PERCENT=1.0
+
+# Optional
+REDIS_URL=redis://localhost:6379/0
+```
+
+### Dockerfile Requirements
+
+- Python 3.11+ slim base image
+- Multi-stage build: install deps → copy code → non-root user
+- Expose port 8000
+- Healthcheck endpoint (`GET /health`)
+- No secrets baked in — all from env vars or mounted config
+
+### docker-compose.yml Structure
+
+```yaml
+services:
+  signal_backend:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data       # SQLite + logs
+      - ./config.yaml:/app/config.yaml
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional: production only
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   restart: unless-stopped
+
+# volumes:
+#   redis_data:
+```
